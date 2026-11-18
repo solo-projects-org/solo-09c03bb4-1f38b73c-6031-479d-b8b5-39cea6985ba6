@@ -52,7 +52,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health(conn: sqlite3.Connection = Depends(db)):
         row = conn.execute("SELECT COUNT(*) AS n FROM intervals WHERE status='current'").fetchone()
         stale = conn.execute("SELECT COUNT(*) AS n FROM intervals WHERE status='stale'").fetchone()
-        return {"status": "ok", "current_intervals": row["n"], "stale_intervals": stale["n"]}
+        pending = conn.execute("SELECT COUNT(*) AS n FROM pending_rebuilds").fetchone()
+        return {
+            "status": "ok",
+            "current_intervals": row["n"],
+            "stale_intervals": stale["n"],
+            "pending_rebuilds": pending["n"],
+        }
 
     @app.post("/readings", response_model=AcceptOut, status_code=201, tags=["读数"])
     def post_reading(
@@ -103,6 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 fail_set.add(device_id)
             else:
                 fail_set.update(service.devices_with_stale_intervals(conn))
+                fail_set.update(service.devices_pending_rebuild(conn))
         try:
             return service.rebuild(
                 conn, device_id=device_id, all_devices=all_devices,

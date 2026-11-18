@@ -48,6 +48,9 @@ docker compose up --build
 - 同 `source_id + revision` 内容不同：**409 拒绝**（`content conflict`）；
 - 回退旧修订号或跳号：**409 拒绝**（`revision rollback` / `non-consecutive revision`）。
 - 内容指纹为除 `source_id/revision` 外业务字段的 SHA-256，入库保留全部历史修订。
+- **来源更正后的供数**：任一来源（读数或交接）只有**最新修订**可参与计算，
+  且该判断是全局的。更正把来源改到另一设备/另一组表号后，原设备（或原表号对）
+  不得再用其旧修订；旧修订仅留作历史追溯。
 
 ### 区间电量 `GET /intervals`
 
@@ -67,13 +70,17 @@ docker compose up --build
 1. 读数/交接一旦**受理**，受影响设备的全部 `current` 区间在同一事务内立即
    置为 `stale`（失去当前供数资格，仍可按 `status=stale` 审计查询）。
 2. 受理后自动按设备重建；也可 `POST /rebuild?device_id=...` 手动重试，
-   或 `POST /rebuild`（默认只重建仍有 stale 区间的设备）。
+   或 `POST /rebuild`（默认覆盖仍有 stale 区间的设备，以及受理时登记的
+   `pending_rebuilds` 设备——例如更正把来源移入原本无任何区间的设备）。
 3. 重建在单事务内完成：失败/进程崩溃时事务回滚，旧结果保持 stale，
    **不会复活为 current**；服务重启不自动重建，只把崩溃遗留的 running
-   运行标记为 `interrupted`（见 `GET /rebuild-runs`）。
+   运行标记为 `interrupted`（见 `GET /rebuild-runs`）。待重建登记持久化在
+   `pending_rebuilds` 表中，只有成功重建才会清除，因此重启后重试也只按
+   **现行修订**重算，旧修订不会被重新供数。
 4. 重建按设备隔离：一个设备失败不影响其他设备，无关区间全程可查；
    重试可完成重建并恢复 current 供数。
-5. 无法判定的区间以 `null` 表达，零值只表示实测零差值。
+5. 无法判定的区间以 `null` 表达，零值只表示实测零差值；有效交接缺失时
+   报 `handover_missing`，历史（stale）区间仍可追溯。
 
 测试钩子：对提交或 `/rebuild` 加请求头 `X-Fail-Rebuild: true`，
 对应设备的重建会在提交前失败，用于验证上述失败/重试场景。
@@ -90,7 +97,7 @@ pytest -q
 
 ```
 app/            FastAPI 应用（models/database/service/main）
-tests/          17 项端到端自测（TestClient + 临时 SQLite 文件）
+tests/          25 项端到端自测（TestClient + 临时 SQLite 文件）
 Dockerfile      python:3.11-slim 镜像，含 /health 健康检查
 docker-compose.yml
 ```

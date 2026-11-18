@@ -325,6 +325,237 @@ def test_unrelated_device_keeps_serving(ctx):
 # 5. Handover correction and end-to-end multi-interval chain
 # ---------------------------------------------------------------------------
 
+def test_reading_correction_moved_to_other_device_stops_old_supply(ctx):
+    """Only the newest revision of a source may order readings on any device."""
+    client, _, _ = ctx
+    client.post("/readings", json=reading("A", 1, "D1", "2026-01-01T00:00:00Z", "M1", 100.0))
+    client.post("/readings", json=reading("B", 1, "D1", "2026-01-01T01:00:00Z", "M1", 110.0))
+    client.post("/readings", json=reading("C", 1, "D1", "2026-01-01T02:00:00Z", "M1", 130.0))
+    before = current_intervals(client, "D1")
+    assert len(before) == 2
+    old_ids = {i["id"] for i in before}
+
+    # Correction: B rev2 now belongs to D2.  D1's old intervals lose current
+    # eligibility immediately, and the rebuild must not use B rev1 for ordering.
+    r = client.post("/readings", json=reading("B", 2, "D2", "2026-01-01T01:00:00Z", "M1", 110.0))
+    assert r.status_code == 201
+    assert sorted(r.json()["affected_devices"]) == ["D1", "D2"]
+
+    stale = [i for i in all_intervals(client, "D1") if i["id"] in old_ids]
+    assert len(stale) == 2 and all(i["status"] == "stale" for i in stale)
+
+    d1 = current_intervals(client, "D1")
+    assert len(d1) == 1  # A -> C only; the moved source is no longer present
+    assert d1[0]["energy_kwh"] == pytest.approx(30.0)
+    assert "B" not in {d1[0]["start_source_id"], d1[0]["end_source_id"]}
+    # D2 owns the corrected reading but has no adjacent pair yet.
+    assert current_intervals(client, "D2") == []
+
+
+def test_corrected_reading_supplies_only_new_device(ctx):
+    client, _, _ = ctx
+    client.post("/readings", json=reading("A", 1, "D1", "2026-01-01T00:00:00Z", "M1", 100.0))
+    client.post("/readings", json=reading("B", 1, "D1", "2026-01-01T01:00:00Z", "M1", 110.0))
+    # Move B to D2 and give D2 a neighbour so its ordering can be checked.
+    client.post("/readings", json=reading("X", 1, "D2", "2026-01-01T00:00:00Z", "M1", 100.0))
+    client.post("/readings", json=reading("B", 2, "D2", "2026-01-01T01:00:00Z", "M1", 110.0))
+    client.post("/readings", json=reading("Y", 1, "D2", "2026-01-01T02:00:00Z", "M1", 130.0))
+
+    d2 = current_intervals(client, "D2")
+    assert len(d2) == 2
+    assert [(i["start_source_id"], i["end_source_id"]) for i in d2] == [
+        ("X", "B"), ("B", "Y")
+    ]
+    assert d2[0]["end_revision"] == 2 and d2[1]["start_revision"] == 2
+    assert current_intervals(client, "D1") == []
+
+
+def test_handover_correction_to_other_meter_pair_revokes_old_settlement(ctx):
+    client, _, _ = ctx
+    client.post("/readings", json=reading("S1", 1, "D1", "2026-01-01T00:00:00Z", "M-old", 100.0))
+    client.post("/readings", json=reading("S2", 1, "D1", "2026-01-01T02:00:00Z", "M-new", 40.0))
+    client.post("/handovers", json=handover(
+        "H1", 1, "D1", "2026-01-01T01:00:00Z", "M-old", 150.0, "M-new", 10.0))
+    settled = current_intervals(client, "D1")[0]
+    assert settled["energy_kwh"] == pytest.approx(80.0)
+    settled_id = settled["id"]
+
+    # Correct the handover to a different meter pair.  Its revision 1 must no
+    # longer match the M-old -> M-new interval, and must not settle it at all.
+    r = client.post("/handovers", json=handover(
+        "H1", 2, "D1", "2026-01-01T01:00:00Z", "M-old", 150.0, "M3", 10.0))
+    assert r.status_code == 201
+
+    old = [i for i in all_intervals(client, "D1") if i["id"] == settled_id]
+    assert old and old[0]["status"] == "stale"   # still available for audit
+    iv = current_intervals(client, "D1")
+    assert len(iv) == 1
+    assert iv[0]["energy_kwh"] is None
+    assert iv[0]["undeterminable"] is True
+    assert iv[0]["reason"].startswith("handover_missing")
+    assert iv[0]["handover_source_id"] is None
+
+
+def test_handover_correction_moving_device_stops_old_device_match(ctx):
+    client, _, _ = ctx
+    client.post("/readings", json=reading("S1", 1, "D1", "2026-01-01T00:00:00Z", "M-old", 100.0))
+    client.post("/readings", json=reading("S2", 1, "D1", "2026-01-01T02:00:00Z", "M-new", 40.0))
+    r = client.post("/handovers", json=handover(
+        "H1", 1, "D1", "2026-01-01T01:00:00Z", "M-old", 150.0, "M-new", 10.0))
+    assert r.status_code == 201
+    assert current_intervals(client, "D1")[0]["energy_kwh"] == pytest.approx(80.0)
+
+    # Revise the handover onto another device: it can no longer settle D1.
+    r = client.post("/handovers", json=handover(
+        "H1", 2, "D2", "2026-01-01T01:00:00Z", "M-old", 150.0, "M-new", 10.0))
+    assert r.status_code == 201
+    assert sorted(r.json()["affected_devices"]) == ["D1", "D2"]
+    iv = current_intervals(client, "D1")[0]
+    assert iv["energy_kwh"] is None and iv["reason"].startswith("handover_missing")
+
+
+def test_failed_rebuild_after_correction_never_revives_old_revision(ctx):
+    client, db_path, _ = ctx
+    client.post("/readings", json=reading("A", 1, "D1", "2026-01-01T00:00:00Z", "M1", 100.0))
+    client.post("/readings", json=reading("B", 1, "D1", "2026-01-01T02:00:00Z", "M1", 130.0))
+    assert current_intervals(client, "D1")[0]["energy_kwh"] == pytest.approx(30.0)
+
+    # Correction moving B to D2, but both rebuilds fail before commit.
+    r = client.post(
+        "/readings", headers={"X-Fail-Rebuild": "true"},
+        json=reading("B", 2, "D2", "2026-01-01T02:00:00Z", "M1", 130.0),
+    )
+    assert r.status_code == 201
+    assert r.json()["rebuild"]["success"] is False
+    assert set(r.json()["rebuild"]["failed_devices"]) == {"D1", "D2"}
+    assert current_intervals(client, "D1") == []
+    assert current_intervals(client, "D2") == []
+    stale = all_intervals(client, "D1")
+    assert stale and all(i["status"] == "stale" for i in stale)
+    assert all("B" not in {i["start_source_id"], i["end_source_id"]} or i["end_revision"] == 1
+               for i in stale)
+
+    # Restart without retrying: still no current intervals, nothing resurrected.
+    app2 = create_app(Settings(db_path=db_path, fail_device=None))
+    with TestClient(app2) as client2:
+        assert current_intervals(client2, "D1") == []
+        assert current_intervals(client2, "D2") == []
+
+        # Retry only rebuilds from the *now-authoritative* revisions: B rev1 is
+        # gone from D1, so D1 has no adjacent pair and yields no interval.
+        r = client2.post("/rebuild", params={"device_id": "D1"})
+        assert r.json()["success"] is True
+        assert current_intervals(client2, "D1") == []
+        r = client2.post("/rebuild", params={"device_id": "D2"})
+        assert r.json()["success"] is True
+        assert current_intervals(client2, "D2") == []
+
+        # Audit history remains queryable.
+        old = [i for i in all_intervals(client2, "D1") if i["status"] == "stale"]
+        assert any(i["energy_kwh"] == pytest.approx(30.0) for i in old)
+        assert any(i["end_source_id"] == "B" and i["end_revision"] == 1 for i in old)
+
+
+def test_default_retry_includes_device_pending_without_stale_rows(ctx):
+    """A source corrected into a device with no prior pair still needs a retry.
+
+    That device has no stale interval row (nothing was current there before),
+    so the pending marker — not the stale row set — must make the default
+    ``POST /rebuild`` include it.
+    """
+    client, _, _ = ctx
+    client.post("/readings", json=reading("A", 1, "D1", "2026-01-01T00:00:00Z", "M1", 100.0))
+    client.post("/readings", json=reading("B", 1, "D1", "2026-01-01T02:00:00Z", "M1", 130.0))
+    # D2 has a single reading, hence no intervals and no stale rows.
+    client.post("/readings", json=reading("X", 1, "D2", "2026-01-01T00:00:00Z", "M1", 100.0))
+    assert current_intervals(client, "D2") == []
+
+    r = client.post(
+        "/readings", headers={"X-Fail-Rebuild": "true"},
+        json=reading("B", 2, "D2", "2026-01-01T02:00:00Z", "M1", 130.0),
+    )
+    assert r.status_code == 201 and r.json()["rebuild"]["success"] is False
+    assert current_intervals(client, "D2") == []
+    d2_stale = [i for i in all_intervals(client, "D2") if i["status"] == "stale"]
+    assert d2_stale == []      # nothing to mark stale, but the device is pending
+
+    # Default rebuild (no device_id) must pick D2 up and derive from B rev2.
+    r = client.post("/rebuild")
+    assert r.json()["success"] is True
+    d2 = current_intervals(client, "D2")
+    assert len(d2) == 1
+    assert d2[0]["start_source_id"] == "X" and d2[0]["end_source_id"] == "B"
+    assert d2[0]["end_revision"] == 2
+    assert d2[0]["energy_kwh"] == pytest.approx(30.0)
+
+
+def test_handover_correction_failed_rebuild_then_retry_uses_new_revision(ctx):
+    client, db_path, _ = ctx
+    client.post("/readings", json=reading("S1", 1, "D1", "2026-01-01T00:00:00Z", "M-old", 100.0))
+    client.post("/readings", json=reading("S2", 1, "D1", "2026-01-01T02:00:00Z", "M-new", 40.0))
+    client.post("/handovers", json=handover(
+        "H1", 1, "D1", "2026-01-01T01:00:00Z", "M-old", 150.0, "M-new", 10.0))
+    assert current_intervals(client, "D1")[0]["energy_kwh"] == pytest.approx(80.0)
+
+    # Correction to a different meter pair; rebuild fails so stale rows remain.
+    client.post(
+        "/handovers", headers={"X-Fail-Rebuild": "true"},
+        json=handover("H1", 2, "D1", "2026-01-01T01:00:00Z", "M-old", 150.0, "M3", 10.0),
+    )
+    assert current_intervals(client, "D1") == []
+
+    # Process restart must not make the old revision eligible again.
+    app2 = create_app(Settings(db_path=db_path, fail_device=None))
+    with TestClient(app2) as client2:
+        assert current_intervals(client2, "D1") == []
+        assert client2.post("/rebuild", params={"device_id": "D1"}).json()["success"] is True
+        iv = current_intervals(client2, "D1")
+        assert len(iv) == 1
+        assert iv[0]["energy_kwh"] is None
+        assert iv[0]["reason"].startswith("handover_missing")
+
+
+def test_correction_does_not_affect_unrelated_devices(ctx):
+    client, _, _ = ctx
+    client.post("/readings", json=reading("A", 1, "D1", "2026-01-01T00:00:00Z", "M1", 100.0))
+    client.post("/readings", json=reading("B", 1, "D1", "2026-01-01T02:00:00Z", "M1", 130.0))
+    client.post("/readings", json=reading("K1", 1, "D2", "2026-01-01T00:00:00Z", "N1", 200.0))
+    client.post("/readings", json=reading("K2", 1, "D2", "2026-01-01T02:00:00Z", "N1", 230.0))
+    before = current_intervals(client, "D2")
+
+    client.post("/readings", json=reading("B", 2, "D1", "2026-01-01T02:00:00Z", "M1", 130.0))
+    after = current_intervals(client, "D2")
+    assert [(i["id"], i["energy_kwh"], i["status"]) for i in after] == [
+        (i["id"], i["energy_kwh"], i["status"]) for i in before
+    ]
+    assert after[0]["energy_kwh"] == pytest.approx(30.0)
+
+
+def test_ambiguous_handovers_still_undeterminable_but_superseded_ones_ignored(ctx):
+    client, _, _ = ctx
+    client.post("/readings", json=reading("S1", 1, "D1", "2026-01-01T00:00:00Z", "M-old", 100.0))
+    client.post("/readings", json=reading("S2", 1, "D1", "2026-01-01T02:00:00Z", "M-new", 40.0))
+    client.post("/handovers", json=handover(
+        "H1", 1, "D1", "2026-01-01T00:30:00Z", "M-old", 150.0, "M-new", 10.0))
+    client.post("/handovers", json=handover(
+        "H2", 1, "D1", "2026-01-01T01:30:00Z", "M-old", 150.0, "M-new", 10.0))
+    iv = current_intervals(client, "D1")[0]
+    assert iv["energy_kwh"] is None and iv["reason"].startswith("ambiguous_handover")
+
+    # If H2's latest revision no longer matches, H1 is the single valid one.
+    client.post("/handovers", json=handover(
+        "H2", 2, "D1", "2026-01-01T01:30:00Z", "M-old", 150.0, "M3", 10.0))
+    iv = current_intervals(client, "D1")[0]
+    assert iv["energy_kwh"] == pytest.approx(80.0)
+    assert iv["handover_source_id"] == "H1" and iv["handover_revision"] == 1
+
+    # Conversely, H1's superseded revision must not keep the pair ambiguous.
+    client.post("/handovers", json=handover(
+        "H1", 2, "D1", "2026-01-01T00:30:00Z", "M-old", 150.0, "M4", 10.0))
+    iv = current_intervals(client, "D1")[0]
+    assert iv["energy_kwh"] is None and iv["reason"].startswith("handover_missing")
+
+
 def test_handover_correction_revises_settlement(ctx):
     client, _, _ = ctx
     client.post("/readings", json=reading("S1", 1, "D1", "2026-01-01T00:00:00Z", "M-old", 100.0))

@@ -83,6 +83,26 @@ def _check_revision(
     return False
 
 
+def _mark_pending(conn: sqlite3.Connection, device_ids: list[str], reason: str) -> None:
+    """Record that a device's current intervals must be recomputed.
+
+    Written in the same transaction as the acceptance of a submission, so a
+    later failed/crashed rebuild leaves the device pending.  Successful rebuilds
+    clear the flag; retries therefore only ever re-derive intervals from the
+    currently authoritative revisions.
+    """
+    for dev in device_ids:
+        conn.execute(
+            "INSERT INTO pending_rebuilds (device_id, reason) VALUES (?, ?) "
+            "ON CONFLICT(device_id) DO UPDATE SET reason = excluded.reason",
+            (dev, reason),
+        )
+
+
+def _clear_pending(conn: sqlite3.Connection, device_id: str) -> None:
+    conn.execute("DELETE FROM pending_rebuilds WHERE device_id = ?", (device_id,))
+
+
 def _stale_current_intervals(conn: sqlite3.Connection, device_ids: list[str]) -> int:
     """Immediately revoke current-supply eligibility on affected devices."""
     if not device_ids:
@@ -132,6 +152,7 @@ def submit_reading(conn: sqlite3.Connection, payload: ReadingIn) -> dict:
                 devices.add(prev["device_id"])
             affected = sorted(devices)
             _stale_current_intervals(conn, affected)
+            _mark_pending(conn, affected, f"reading {payload.source_id} revision {payload.revision}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -183,6 +204,10 @@ def submit_handover(conn: sqlite3.Connection, payload: HandoverIn) -> dict:
                 devices.add(prev["device_id"])
             affected = sorted(devices)
             _stale_current_intervals(conn, affected)
+            _mark_pending(
+                conn, affected,
+                f"handover {payload.source_id} revision {payload.revision}",
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -202,25 +227,20 @@ def submit_handover(conn: sqlite3.Connection, payload: HandoverIn) -> dict:
 # ---------------------------------------------------------------------------
 
 def _latest_readings(conn: sqlite3.Connection, device_id: str) -> list[sqlite3.Row]:
-    """Authoritative readings: highest revision of every source of a device."""
+    """Authoritative readings of a device.
+
+    Only the newest revision of a source may supply data, *globally*: if the
+    latest revision moved the source to another device, the source has no
+    authoritative reading here any more (its old revision must not be used).
+    """
     return conn.execute(
         "WITH latest AS ("
         "  SELECT source_id, MAX(revision) AS max_rev FROM readings "
-        "  WHERE device_id = ? GROUP BY source_id"
+        "  GROUP BY source_id"
         ") SELECT r.* FROM readings r JOIN latest l "
         "ON r.source_id = l.source_id AND r.revision = l.max_rev "
+        "WHERE r.device_id = ? "
         "ORDER BY r.ts ASC, r.id ASC",
-        (device_id,),
-    ).fetchall()
-
-
-def _latest_handovers(conn: sqlite3.Connection, device_id: str) -> list[sqlite3.Row]:
-    return conn.execute(
-        "WITH latest AS ("
-        "  SELECT source_id, MAX(revision) AS max_rev FROM handovers "
-        "  WHERE device_id = ? GROUP BY source_id"
-        ") SELECT h.* FROM handovers h JOIN latest l "
-        "ON h.source_id = l.source_id AND h.revision = l.max_rev",
         (device_id,),
     ).fetchall()
 
@@ -256,20 +276,20 @@ def _settle_interval(
         return {**common, "energy_kwh": round(diff, 9), "reason": None}
 
     # Cross-meter interval: look for the unique matching handover inside it.
+    # Only the newest revision of a handover source is eligible, globally: a
+    # corrected handover whose latest revision now names another meter pair,
+    # time or device must not let its superseded revision settle anything.
     matches = conn.execute(
-        "SELECT * FROM handovers WHERE device_id = ? AND ts > ? AND ts < ? "
-        "AND old_meter_no = ? AND new_meter_no = ? "
-        "AND source_id IN (SELECT source_id FROM handovers WHERE device_id = ?) "
-        "ORDER BY id",
-        (device_id, a["ts"], b["ts"], a["meter_no"], b["meter_no"], device_id),
+        "SELECT h.* FROM handovers h JOIN ("
+        "  SELECT source_id, MAX(revision) AS max_rev FROM handovers "
+        "  GROUP BY source_id"
+        ") l ON h.source_id = l.source_id AND h.revision = l.max_rev "
+        "WHERE h.device_id = ? AND h.ts > ? AND h.ts < ? "
+        "AND h.old_meter_no = ? AND h.new_meter_no = ? "
+        "ORDER BY h.id",
+        (device_id, a["ts"], b["ts"], a["meter_no"], b["meter_no"]),
     ).fetchall()
-    # Keep only the latest revision per handover source.
-    latest: dict[str, sqlite3.Row] = {}
-    for h in matches:
-        cur = latest.get(h["source_id"])
-        if cur is None or h["revision"] > cur["revision"]:
-            latest[h["source_id"]] = h
-    unique = list(latest.values())
+    unique = list(matches)
 
     if len(unique) == 0:
         return {**common, "energy_kwh": None,
@@ -300,6 +320,13 @@ def devices_with_stale_intervals(conn: sqlite3.Connection) -> list[str]:
         for r in conn.execute(
             "SELECT DISTINCT device_id FROM intervals WHERE status = 'stale' ORDER BY 1"
         )
+    ]
+
+
+def devices_pending_rebuild(conn: sqlite3.Connection) -> list[str]:
+    return [
+        r["device_id"]
+        for r in conn.execute("SELECT device_id FROM pending_rebuilds ORDER BY 1")
     ]
 
 
@@ -336,9 +363,6 @@ def rebuild_device(
             )
 
         readings = _latest_readings(conn, device_id)
-        # Touch the handover table so its latest revisions are considered even
-        # when no cross-meter interval exists yet.
-        _latest_handovers(conn, device_id)
 
         rows = [
             _settle_interval(conn, device_id, readings[i], readings[i + 1])
@@ -369,6 +393,7 @@ def rebuild_device(
             "finished_at = ? WHERE id = ?",
             (utc_now_iso(), run_id),
         )
+        _clear_pending(conn, device_id)
         conn.commit()
         return len(rows)
     except RebuildFailure:
@@ -401,25 +426,27 @@ def rebuild(
 
     ``devices`` limits the run to an explicit set (used by automatic rebuilds
     after submissions, including a device's very first reading when no stale
-    rows exist yet).  By default all devices that have readings are rebuilt;
-    ``only_stale=True`` limits the run to devices currently holding stale
-    intervals.  A failure on one device is recorded and does not abort the
-    others; stale intervals of a failed device remain queryable as stale and
-    never regain current eligibility.
+    rows exist yet).  By default the run covers every device with stale
+    intervals plus every device recorded in ``pending_rebuilds``; a correction
+    that moved a source into a device with no prior interval leaves no stale
+    row there, so the pending marker is what guarantees the retry reaches it.
+    ``only_stale`` is kept for backward compatibility.  A failure on one device
+    is recorded and does not abort the others; stale intervals of a failed
+    device remain queryable as stale and never regain current eligibility.
     """
     if device_id is not None:
         targets = [device_id]
     elif devices is not None:
         targets = list(dict.fromkeys(devices))  # de-duplicate, keep order
     elif all_devices or not only_stale:
-        targets = [
-            r["device_id"]
-            for r in conn.execute(
-                "SELECT DISTINCT device_id FROM readings ORDER BY 1"
-            )
-        ]
+        targets = sorted(
+            {r["device_id"] for r in conn.execute("SELECT DISTINCT device_id FROM readings")}
+            | set(devices_pending_rebuild(conn))
+        )
     else:
-        targets = devices_with_stale_intervals(conn)
+        targets = sorted(
+            set(devices_with_stale_intervals(conn)) | set(devices_pending_rebuild(conn))
+        )
 
     rebuilt: list[str] = []
     failed: dict[str, str] = {}
@@ -433,6 +460,8 @@ def rebuild(
             rebuilt.append(f"{dev} ({n} intervals)")
         except RebuildFailure as exc:
             failed[dev] = exc.reason
+        except Exception as exc:  # a real failure must not stop other devices
+            failed[dev] = f"{type(exc).__name__}: {exc}"
 
     success = not failed
     run_row = conn.execute(

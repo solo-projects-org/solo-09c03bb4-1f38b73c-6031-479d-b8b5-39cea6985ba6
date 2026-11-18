@@ -80,6 +80,17 @@ CREATE INDEX IF NOT EXISTS idx_intervals_device_status
     ON intervals(device_id, status);
 CREATE INDEX IF NOT EXISTS idx_intervals_status ON intervals(status);
 
+-- Devices whose current intervals must be recomputed.  A row is written in
+-- the same transaction that accepts a late submission/correction and is
+-- removed only by a successful rebuild, so a failed/crashed/restarted rebuild
+-- leaves the device pending even when it currently has no stale interval rows
+-- (e.g. a correction that moved a source into a device with no prior pair).
+CREATE TABLE IF NOT EXISTS pending_rebuilds (
+    device_id   TEXT PRIMARY KEY,
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 -- Rebuild run audit trail.  'failed'/'interrupted' runs never delete stale
 -- rows, and no run is ever started on service boot.
 CREATE TABLE IF NOT EXISTS rebuild_runs (
